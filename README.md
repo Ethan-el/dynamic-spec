@@ -80,17 +80,20 @@ llm = LLM(
 
 ## Benchmark
 
-See `benchmarks/` for benchmarks.
+The formal dynamic speculative benchmark uses an RTX 3090, Qwen3-8B as the
+Target model, Qwen3-0.6B as the Draft model, and eight heterogeneous requests.
+Each request has 128 input tokens and an output limit from
+`[80, 140, 200, 260, 320, 400, 460, 512]`.
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+The dynamic schedule is `BS=8 -> K=0`, `BS=4..7 -> K=3`, and
+`BS=1..3 -> K=5`. CUDA Graph is enabled and K=0 Draft synchronization is
+skipped.
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+| Inference Mode | Output Tokens | Time (s) | Throughput (tokens/s) | Speedup vs Decode |
+|---|---:|---:|---:|---:|
+| Ordinary Decode | 2,372 | 10.99 | 215.77 | 1.000x |
+| Fixed K=3 | 2,372 | 12.60 | 188.31 | 0.873x |
+| Fixed K=5 | 2,372 | 11.72 | 202.47 | 0.938x |
+| Dynamic K=0/3/5 | 2,372 | 9.80 | **242.06** | **1.122x (+12.2%)** |
+
+See `benchmarks/benchmark_dynamic_k_transition.py` for detailed diagnostics.
