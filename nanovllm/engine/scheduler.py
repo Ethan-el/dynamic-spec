@@ -1,6 +1,7 @@
 from collections import deque
 
 from nanovllm.config import Config
+from nanovllm.dynamic_speculative import build_dynamic_speculative_lookup
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
@@ -12,7 +13,28 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.max_num_speculative_tokens = config.num_speculative_tokens
+        dynamic_schedule = getattr(
+            config,
+            "num_speculative_tokens_per_batch_size",
+            None,
+        )
+        self.dynamic_speculative_lookup = (
+            build_dynamic_speculative_lookup(
+                dynamic_schedule,
+                self.max_num_seqs,
+                self.max_num_speculative_tokens,
+            )
+            if dynamic_schedule is not None
+            else None
+        )
+        self.last_num_speculative_tokens = 0
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            num_draft_blocks=config.num_draft_kvcache_blocks,
+            num_speculative_tokens=config.num_speculative_tokens,
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -22,7 +44,19 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def select_num_speculative_tokens(self, batch_size: int) -> int:
+        if batch_size <= 0 or batch_size > self.max_num_seqs:
+            raise ValueError(
+                f"batch_size must be in [1, {self.max_num_seqs}], got {batch_size}"
+            )
+        if self.dynamic_speculative_lookup is None:
+            return self.max_num_speculative_tokens
+        return self.dynamic_speculative_lookup[batch_size]
+
     def schedule(self) -> tuple[list[Sequence], bool]:
+        # Prefill does not draft. Decode overwrites this after preemption has
+        # finalized the actual runnable batch.
+        self.last_num_speculative_tokens = 0
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -70,6 +104,9 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
+        self.last_num_speculative_tokens = self.select_num_speculative_tokens(
+            len(scheduled_seqs)
+        )
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
@@ -78,7 +115,16 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(
+        self,
+        seqs: list[Sequence],
+        token_ids: list[int] | list[list[int]],
+        is_prefill: bool,
+    ):
+        if token_ids and isinstance(token_ids[0], list):
+            self._postprocess_speculative(seqs, token_ids)
+            return
+
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
@@ -87,6 +133,42 @@ class Scheduler:
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+
+    def _postprocess_speculative(
+        self,
+        seqs: list[Sequence],
+        token_id_lists: list[list[int]],
+    ):
+        for seq, new_tokens in zip(seqs, token_id_lists):
+            num_new_tokens = len(new_tokens)
+            completion_before = seq.num_completion_tokens - num_new_tokens
+            num_to_keep = num_new_tokens
+
+            for index, token_id in enumerate(new_tokens):
+                reached_eos = not seq.ignore_eos and token_id == self.eos
+                reached_limit = completion_before + index + 1 >= seq.max_tokens
+                if reached_eos or reached_limit:
+                    num_to_keep = index + 1
+                    break
+
+            num_to_trim = num_new_tokens - num_to_keep
+            if num_to_trim:
+                seq.pop_last_n_tokens(num_to_trim)
+                seq.draft_kv_len = min(seq.draft_kv_len, len(seq))
+
+            # The target verified accepted draft tokens. The final correction
+            # or bonus token has not passed through the target model unless it
+            # was trimmed by EOS/max_tokens handling.
+            target_kv_len = len(seq) if num_to_trim else len(seq) - 1
+            self.block_manager.hash_blocks_until(seq, target_kv_len)
+            seq.num_cached_tokens = target_kv_len
+            seq.num_scheduled_tokens = 0
+
+            reached_eos = not seq.ignore_eos and seq.last_token == self.eos
+            if reached_eos or seq.num_completion_tokens >= seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

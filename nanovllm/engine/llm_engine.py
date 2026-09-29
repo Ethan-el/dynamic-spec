@@ -10,14 +10,19 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.profiling import nvtx_range
 
 
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        self._closed = False
+        self.last_step_stats = None
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
+        self.last_step_num_speculative_tokens = 0
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -35,6 +40,9 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if self._closed:
+            return
+        self._closed = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -47,10 +55,54 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        with nvtx_range("nano.scheduler.schedule"):
+            seqs, is_prefill = self.scheduler.schedule()
+        num_speculative_tokens = self.scheduler.last_num_speculative_tokens
+        self.last_step_num_speculative_tokens = num_speculative_tokens
+        scheduled_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
+        with nvtx_range("nano.runner.prefill" if is_prefill else "nano.runner.decode"):
+            token_ids = self.model_runner.call(
+                "run", seqs, is_prefill, num_speculative_tokens
+            )
+
+        if not is_prefill and token_ids and isinstance(token_ids[0], list):
+            generated_counts = [len(ids) for ids in token_ids]
+            accepted_draft_tokens = sum(max(0, count - 1) for count in generated_counts)
+            attempted_draft_tokens = len(seqs) * num_speculative_tokens
+        elif not is_prefill:
+            generated_counts = [1] * len(seqs)
+            accepted_draft_tokens = 0
+            attempted_draft_tokens = 0
+        else:
+            generated_counts = [0] * len(seqs)
+            accepted_draft_tokens = 0
+            attempted_draft_tokens = 0
+
+        self.last_step_stats = {
+            "is_prefill": is_prefill,
+            "batch_size": len(seqs),
+            "seq_ids": [seq.seq_id for seq in seqs],
+            "generated_counts": generated_counts,
+            "accepted_draft_tokens": accepted_draft_tokens,
+            "attempted_draft_tokens": attempted_draft_tokens,
+            "num_speculative_tokens": num_speculative_tokens,
+            "draft_sync": bool(
+                not is_prefill
+                and self.config.speculative_model
+                and num_speculative_tokens == 0
+                and not self.config.skip_draft_kv_on_k0
+            ),
+            "draft_sync_skipped": bool(
+                not is_prefill
+                and self.config.speculative_model
+                and num_speculative_tokens == 0
+                and self.config.skip_draft_kv_on_k0
+            ),
+        }
+        num_tokens = scheduled_tokens if is_prefill else -sum(generated_counts)
+
+        with nvtx_range("nano.scheduler.postprocess"):
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

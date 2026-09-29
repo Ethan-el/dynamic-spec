@@ -69,7 +69,32 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            if context.num_speculative_tokens > 0:
+                verify_width = context.num_speculative_tokens + 1
+
+                q = q.view(
+                    -1,
+                    verify_width, # K+1
+                    self.num_heads,
+                    self.head_dim,
+                )
+            else:
+                q = q.unsqueeze(1)
+
+            o = flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_seqlens=context.context_lens,
+                block_table=context.block_tables,
+                softmax_scale=self.scale,
+                causal=True,
+                )
+
+            o = o.view(
+                -1,
+                self.num_heads,
+                self.head_dim,
+            )
+
         return o

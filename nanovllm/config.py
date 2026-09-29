@@ -2,6 +2,10 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from nanovllm.dynamic_speculative import (
+    validate_and_normalize_dynamic_speculative_schedule,
+)
+
 
 @dataclass(slots=True)
 class Config:
@@ -16,6 +20,11 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 0
+    num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None
+    skip_draft_kv_on_k0: bool = False
+    num_draft_kvcache_blocks: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -23,3 +32,16 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        if self.speculative_model is not None:
+            assert os.path.isdir(self.speculative_model)
+            assert self.num_speculative_tokens > 0
+            if self.num_speculative_tokens_per_batch_size is not None:
+                self.num_speculative_tokens_per_batch_size = (
+                    validate_and_normalize_dynamic_speculative_schedule(
+                        self.num_speculative_tokens_per_batch_size
+                    )
+                )
+        #     assert self.tensor_parallel_size == 1, "speculative decoding MVP only supports tensor_parallel_size=1"
+        #     assert self.enforce_eager, "speculative decoding MVP requires enforce_eager=True"
+        # else:
+        #     assert self.num_speculative_tokens == 0

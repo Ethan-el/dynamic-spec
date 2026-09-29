@@ -193,3 +193,13 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local experiments and unrelated copies
+/results/
+/backups/
+/backup/
+/nano-vllm-backups/
+/nano-vllm-speculative-decoding/
+/spec_decodeing/
+*.nsys-rep
+*.sqlite

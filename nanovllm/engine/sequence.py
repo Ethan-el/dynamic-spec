@@ -25,7 +25,9 @@ class Sequence:
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
-        self.block_table = []
+        self.block_table = [] #目标模型
+        self.draft_block_table: list[int] = [] #草稿模型
+        self.draft_kv_len: int = 0 #草稿长度
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -69,12 +71,38 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def pop_last_n_tokens(self, n: int):
+        assert 0 <= n < self.num_tokens
+        if n == 0:
+            return
+
+        del self.token_ids[-n:]
+        self.num_tokens -= n
+        self.last_token = self.token_ids[-1]
+
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.draft_block_table,
+            self.draft_kv_len,
+            last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.draft_block_table,
+            self.draft_kv_len,
+            last_state,
+        ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
