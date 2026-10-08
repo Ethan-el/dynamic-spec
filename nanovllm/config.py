@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from nanovllm.fp8 import Fp8Config
 from nanovllm.dynamic_speculative import (
     validate_and_normalize_dynamic_speculative_schedule,
 )
@@ -16,7 +17,9 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    quantization: str | None = None
     hf_config: AutoConfig | None = None
+    quant_config: Fp8Config | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -31,6 +34,10 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        self.quant_config = Fp8Config.from_hf_config(self.hf_config, self.quantization)
+        if self.quant_config is not None and self.tensor_parallel_size != 1:
+            raise NotImplementedError("FP8 v1 only supports tensor_parallel_size=1")
+        self.quantization = "fp8" if self.quant_config is not None else None
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if self.speculative_model is not None:
             assert os.path.isdir(self.speculative_model)

@@ -32,11 +32,38 @@ fixed and batch-size-aware dynamic speculative decoding.
 See [the dynamic speculative decoding report](docs/DYNAMIC_SPECULATIVE_DECODING_REPORT.md)
 for the control flow and [DEPENDENCIES.md](DEPENDENCIES.md) for the tested environment.
 
+## Quantization
+
+This fork implements **FP8 W8A8 inference for Qwen3**:
+
+* E4M3 weights with `128 x 128` block-wise scales, loaded directly from Hugging Face FP8 checkpoints.
+* Dynamic E4M3 activation quantization in 128-element blocks.
+* A fused Triton FP8 matrix-multiplication path for the QKV, attention output, and MLP projections.
+* Automatic FP8 checkpoint detection, or explicit `quantization="fp8"` selection.
+* A CPU dequantization fallback for correctness tests. Embeddings, normalization, and the LM head keep their checkpoint dtype.
+
+Current limits: tensor parallelism, static activation scales, and non-E4M3/block-128 checkpoints are rejected. Unit tests and packed QKV/MLP checkpoint loading pass; GPU output correctness and performance still need validation on an active CUDA host.
+
+```python
+llm = LLM(
+    "/YOUR/QWEN3-FP8-MODEL/PATH",
+    quantization="fp8",
+    tensor_parallel_size=1,
+)
+```
+
+Planned quantization work, in priority order:
+
+1. Validate FP8 generation quality and benchmark latency, throughput, and memory on GPU.
+2. Add FP8 tensor parallelism and static activation-scale support.
+3. Add INT4 weight-only inference (W4A16), starting with AWQ/GPTQ checkpoint loading and a fused GEMM kernel.
+4. Add INT8 W8A8 and quantized KV cache after the weight-only path is measured.
+
 ## Installation
 
 ```bash
-git clone git@github.com:Ethan-el/nano-vllm-dynamic-spec.git
-cd nano-vllm-dynamic-spec
+git clone git@github.com:Ethan-el/dynamic-spec.git
+cd dynamic-spec
 pip install -e .
 ```
 
