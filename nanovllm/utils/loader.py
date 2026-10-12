@@ -29,9 +29,9 @@ def load_model(model: nn.Module, path: str):
             for weight_name in f.keys():
                 param_name, shard_id = weight_name, None
                 for k in packed_modules_mapping:
-                    if k in weight_name:
+                    if k in weight_name.split("."):
                         v, shard_id = packed_modules_mapping[k]
-                        param_name = weight_name.replace(k, v)
+                        param_name = ".".join(v if part == k else part for part in weight_name.split("."))
                         break
                 module = _wna16_module(model, param_name)
                 if module is not None and param_name.endswith(".g_idx"):

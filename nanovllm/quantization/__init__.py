@@ -28,13 +28,15 @@ def _read_raw_config(hf_config, model_path: str) -> dict | None:
     return None
 
 
-def resolve_quant_config(hf_config, model_path: str, requested: str | None) -> QuantConfig | None:
+def resolve_quant_config(hf_config, model_path: str, requested: str | None, awq_checkpoint_format: str | None = None) -> QuantConfig | None:
     """Detect the checkpoint format; ``requested`` must agree with it when given."""
     raw = _read_raw_config(hf_config, model_path)
     method = str(raw.get("quant_method", "")).lower() if raw is not None else None
     requested = requested.lower() if requested is not None else None
     if requested is not None and requested not in ("fp8", "awq", "gptq"):
         raise ValueError(f"unsupported quantization: {requested!r}")
+    if awq_checkpoint_format is not None and method != "awq":
+        raise ValueError("awq_checkpoint_format requires an AWQ checkpoint")
     if method is None:
         if requested is not None:
             raise ValueError(f"quantization={requested!r} requires a {requested} checkpoint")
@@ -43,6 +45,8 @@ def resolve_quant_config(hf_config, model_path: str, requested: str | None) -> Q
         raise ValueError(f"checkpoint quant_method is {method!r}, not {requested!r}")
     if method == "fp8":
         return Fp8Config.from_hf_config(SimpleNamespace(quantization_config=raw), "fp8")
+    if method == "awq":
+        return AWQConfig.from_config(raw, awq_checkpoint_format).with_model_path(model_path)
     if method in _WNA16_CONFIGS:
         return _WNA16_CONFIGS[method].from_config(raw)
     raise NotImplementedError(f"unsupported checkpoint quant_method {method!r}")

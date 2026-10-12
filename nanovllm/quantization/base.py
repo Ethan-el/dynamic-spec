@@ -128,7 +128,7 @@ def launch_wna16_kernel(
     m, k = x_2d.shape
     n = scales.shape[1]
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    block_m = min(max(triton.next_power_of_2(m), 16), 64)
+    block_m = constexprs.pop("BLOCK_M", min(max(triton.next_power_of_2(m), 16), 64))
     block_n = 64
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
     kernel[grid](

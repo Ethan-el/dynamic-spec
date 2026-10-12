@@ -3,6 +3,8 @@
 import quant_testlib as lib  # noqa: F401  (installs GPU stubs first)
 
 import tempfile
+import json
+import os
 import unittest
 
 import torch
@@ -12,6 +14,7 @@ from nanovllm.layers.linear import QKVParallelLinear
 from nanovllm.quantization import resolve_quant_config
 from nanovllm.quantization.awq import AWQConfig
 from nanovllm.quantization.gptq import GPTQConfig
+from safetensors.torch import save_file
 
 AWQ_RAW = {"quant_method": "awq", "bits": 4, "group_size": 32}
 GPTQ_RAW = {"quant_method": "gptq", "bits": 4, "group_size": 32}
@@ -28,6 +31,22 @@ def model_dir(quantization_config=None) -> str:
 
 
 class TestEngineConfig(unittest.TestCase):
+    def test_reference_format_selection_and_checkpoint_scan(self):
+        path = model_dir(AWQ_RAW)
+        save_file({"model.layers.0.self_attn.q_proj.qweight": torch.zeros(64, 8, dtype=torch.int32)}, os.path.join(path, "model.safetensors"))
+        config = Config(path, awq_checkpoint_format="nano-vllm")
+        self.assertEqual(config.quant_config.checkpoint_format, "nano-vllm")
+        self.assertEqual(config.quant_config.quantized_modules, frozenset({"model.layers.0.self_attn.q_proj"}))
+        with self.assertRaisesRegex(ValueError, "requires an AWQ"):
+            Config(model_dir(), awq_checkpoint_format="nano-vllm")
+
+    def test_reference_sidecar_metadata(self):
+        path = model_dir()
+        with open(os.path.join(path, "quantize_config.json"), "w") as f:
+            json.dump({"quant_method": "awq", "w_bit": 4, "q_group_size": 32, "modules_to_not_convert": ["lm_head"]}, f)
+        config = Config(path, awq_checkpoint_format="nano-vllm")
+        self.assertEqual(config.quant_config, AWQConfig(32, "nano-vllm"))
+
     def test_dispatch_and_runtime_dtype(self):
         for raw, quantization, quant_type, dtype in (
             (None, None, type(None), torch.bfloat16),

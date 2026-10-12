@@ -20,6 +20,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     quantization: str | None = None
+    awq_checkpoint_format: str | None = None
     hf_config: AutoConfig | None = None
     quant_config: QuantConfig | None = None
     dtype: torch.dtype | None = None
@@ -37,7 +38,7 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        self.quant_config = resolve_quant_config(self.hf_config, self.model, self.quantization)
+        self.quant_config = resolve_quant_config(self.hf_config, self.model, self.quantization, self.awq_checkpoint_format)
         if self.quant_config is None:
             self.quantization = None
         elif isinstance(self.quant_config, Fp8Config):

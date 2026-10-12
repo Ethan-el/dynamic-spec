@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.fp8 import fp8_linear
-from nanovllm.quantization import QuantConfig
+from nanovllm.quantization import AWQConfig, QuantConfig
 from nanovllm.quantization.base import PACK_FACTOR, WNA16Config
 
 WNA16_PARAMS = ("qweight", "qzeros", "scales")
@@ -25,6 +25,7 @@ class LinearBase(nn.Module):
         bias: bool = False,
         tp_dim: int | None = None,
         quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_dim = tp_dim
@@ -32,6 +33,8 @@ class LinearBase(nn.Module):
         self.tp_size = dist.get_world_size()
         self.input_size = input_size
         self.output_size = output_size
+        if isinstance(quant_config, AWQConfig) and not quant_config.is_layer_quantized(prefix):
+            quant_config = None
         self.quant_config = quant_config
         if isinstance(quant_config, WNA16Config):
             self.create_wna16_weights(quant_config)
@@ -101,7 +104,7 @@ class LinearBase(nn.Module):
 
     def wna16_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
         name = param.wna16_name
-        offset, size = self.output_shard(loaded_shard_id)
+        offset, size = (0, self.output_size) if loaded_shard_id is None else self.output_shard(loaded_shard_id)
         if self.quant_config.packs_output_dim(name):
             if offset % PACK_FACTOR or size % PACK_FACTOR:
                 raise ValueError(f"shard {loaded_shard_id!r} width {size} is not divisible by {PACK_FACTOR}")
@@ -114,13 +117,18 @@ class LinearBase(nn.Module):
                 f"does not match expected {tuple(target.shape)}"
             )
         key = (name, loaded_shard_id)
-        if key in self.loaded_wna16_shards:
+        if key in self.loaded_wna16_shards or (name, None) in self.loaded_wna16_shards or (
+            loaded_shard_id is None and any(loaded_name == name for loaded_name, _ in self.loaded_wna16_shards)
+        ):
             raise ValueError(f"{name} shard {loaded_shard_id!r} was loaded twice")
         target.copy_(loaded_weight)
         self.loaded_wna16_shards.add(key)
 
     def check_wna16_loaded(self, prefix: str):
-        expected = {(name, shard_id) for name in WNA16_PARAMS for shard_id in self.shard_ids}
+        expected = {
+            (name, shard_id) for name in WNA16_PARAMS for shard_id in self.shard_ids
+            if (name, None) not in self.loaded_wna16_shards
+        }
         missing = expected - self.loaded_wna16_shards
         if missing:
             raise ValueError(f"{prefix}: checkpoint is missing quantized tensors {sorted(map(str, missing))}")
@@ -155,9 +163,10 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0, quant_config)
+        super().__init__(input_size, divide(output_size, tp_size), bias, 0, quant_config, prefix)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -181,10 +190,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         output_sizes: list[int],
         bias: bool = False,
         quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         self.output_sizes = output_sizes
         self.shard_ids = tuple(range(len(output_sizes)))
-        super().__init__(input_size, sum(output_sizes), bias, quant_config)
+        super().__init__(input_size, sum(output_sizes), bias, quant_config, prefix)
 
     def output_shard(self, loaded_shard_id: int) -> tuple[int, int]:
         offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
@@ -219,6 +229,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
         quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
@@ -226,7 +237,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.num_heads = divide(total_num_heads, tp_size)
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
-        super().__init__(hidden_size, output_size, bias, quant_config)
+        super().__init__(hidden_size, output_size, bias, quant_config, prefix)
 
     def output_shard(self, loaded_shard_id: str) -> tuple[int, int]:
         q_size = self.num_heads * self.head_size
@@ -274,9 +285,10 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1, quant_config)
+        super().__init__(divide(input_size, tp_size), output_size, bias, 1, quant_config, prefix)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data

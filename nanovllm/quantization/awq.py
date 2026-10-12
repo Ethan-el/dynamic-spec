@@ -1,13 +1,16 @@
-"""AutoAWQ GEMM checkpoints: 4-bit weights packed along the output dimension.
+"""AutoAWQ and nano-vLLM AWQ: distinct checkpoint layouts, one packed GEMM.
 
 Adapted from Brassinai/nano-vllm@e909386a (nanovllm/quantization/awq.py).
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field, replace
+from glob import glob
 
 import torch
 import triton
 import triton.language as tl
+from safetensors import safe_open
 
 from nanovllm.quantization.base import (
     PACK_FACTOR,
@@ -56,6 +59,7 @@ def _awq_matmul_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    ZERO_OFFSET: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(m, BLOCK_M)
@@ -95,7 +99,7 @@ def _awq_matmul_kernel(
             mask=w_mask,
             other=0,
         )
-        zeros = (packed_zeros >> n_shifts[None, :]) & 0xF
+        zeros = ((packed_zeros >> n_shifts[None, :]) & 0xF) + ZERO_OFFSET
         scales = tl.load(
             scales_ptr + groups[:, None] * stride_sg + offs_n[None, :] * stride_sn,
             mask=w_mask,
@@ -116,9 +120,22 @@ def _awq_matmul_kernel(
 @dataclass(frozen=True)
 class AWQConfig(WNA16Config):
     method = "awq"
+    checkpoint_format: str = "autoawq"
+    quantized_modules: frozenset[str] | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self):
+        check_group_size(self.group_size)
+        if self.checkpoint_format not in ("autoawq", "nano-vllm"):
+            raise ValueError(f"unsupported AWQ checkpoint_format {self.checkpoint_format!r}")
+        if self.checkpoint_format == "nano-vllm" and self.group_size <= 0:
+            raise ValueError("nano-vllm AWQ requires a positive group_size")
+
+    @property
+    def zero_offset(self) -> int:
+        return int(self.checkpoint_format == "nano-vllm")
 
     @classmethod
-    def from_config(cls, raw: dict) -> "AWQConfig":
+    def from_config(cls, raw: dict, checkpoint_format: str | None = None) -> "AWQConfig":
         bits = int(raw.get("bits", raw.get("w_bit", 0)))
         group_size = int(raw.get("group_size", raw.get("q_group_size", 0)))
         version = str(raw.get("version") or "gemm").lower()
@@ -128,9 +145,36 @@ class AWQConfig(WNA16Config):
             raise NotImplementedError(f"only AWQ GEMM checkpoints are supported, got version={version!r}")
         if not raw.get("zero_point", True):
             raise NotImplementedError("AWQ checkpoints without zero points are not supported")
-        if raw.get("modules_to_not_convert"):
-            raise NotImplementedError("partially quantized AWQ checkpoints are not supported")
-        return cls(check_group_size(group_size))
+        return cls(check_group_size(group_size), checkpoint_format or raw.get("checkpoint_format", "autoawq"))
+
+    def with_model_path(self, model_path: str) -> "AWQConfig":
+        files = glob(os.path.join(model_path, "*.safetensors"))
+        if not files:
+            return self  # Metadata-only config construction; load_model validates tensors.
+        modules = set()
+        for file in files:
+            with safe_open(file, "pt", "cpu") as weights:
+                modules.update(name.removesuffix(".qweight") for name in weights.keys() if name.endswith(".qweight"))
+        if not modules:
+            raise ValueError(f"AWQ checkpoint has no packed qweight tensors under {model_path!r}")
+        return replace(self, quantized_modules=frozenset(modules))
+
+    def is_layer_quantized(self, prefix: str) -> bool:
+        if self.quantized_modules is None or prefix in self.quantized_modules:
+            return True
+        sources = (prefix,)
+        for fused, names in (
+            ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+            ("gate_up_proj", ("gate_proj", "up_proj")),
+        ):
+            if prefix.endswith("." + fused):
+                base = prefix.removesuffix(fused)
+                sources = tuple(base + name for name in names)
+                break
+        matches = [source in self.quantized_modules for source in sources]
+        if any(matches) and not all(matches):
+            raise ValueError(f"AWQ checkpoint quantizes only part of fused layer {prefix!r}: expected {sources!r}")
+        return all(matches)
 
     def qweight_shape(self, input_size: int, output_size: int) -> tuple[int, int]:
         if output_size % PACK_FACTOR:
@@ -141,13 +185,15 @@ class AWQConfig(WNA16Config):
         return name in ("qweight", "qzeros")
 
     def convert_checkpoint_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
-        return awq_to_natural(tensor) if name in ("qweight", "qzeros") else tensor
+        if self.checkpoint_format == "autoawq" and name in ("qweight", "qzeros"):
+            return awq_to_natural(tensor)
+        return tensor
 
     def unpack_qweight(self, qweight: torch.Tensor) -> torch.Tensor:
         return unpack_int4(qweight, 1)
 
     def unpack_qzeros(self, qzeros: torch.Tensor) -> torch.Tensor:
-        return unpack_int4(qzeros, 1)
+        return unpack_int4(qzeros, 1) + self.zero_offset
 
     def matmul(self, x, qweight, qzeros, scales, bias):
         return launch_wna16_kernel(
@@ -158,4 +204,6 @@ class AWQConfig(WNA16Config):
             scales,
             bias,
             self.effective_group_size(x.shape[-1]),
+            ZERO_OFFSET=self.zero_offset,
+            BLOCK_M=16,
         )

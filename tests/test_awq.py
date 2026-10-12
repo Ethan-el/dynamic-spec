@@ -9,8 +9,9 @@ import torch.nn.functional as F
 
 from nanovllm.quantization import resolve_quant_config
 from nanovllm.quantization.awq import AWQConfig, awq_to_natural
-from nanovllm.quantization.base import unpack_int4
+from nanovllm.quantization.base import pack_int4, unpack_int4
 from upstream import autoawq
+from upstream.nano_awq_packing import pack_awq_qweight, pack_awq_qzeros
 
 WQLinear_GEMM, dequantize_gemm = autoawq()
 
@@ -37,6 +38,23 @@ def autoawq_checkpoint(group_size: int, seed: int = 0):
     return tensors, reference
 
 
+def nano_awq_checkpoint(group_size: int):
+    tensors, reference = lib.unquantized_tensors(), {}
+    generator = torch.Generator().manual_seed(42)
+    for name, (k, n) in lib.PROJECTIONS.items():
+        groups = torch.arange(k) // group_size
+        q = torch.randint(0, 16, (n, k), generator=generator, dtype=torch.int32)
+        zeros = torch.randint(1, 16, (-(-k // group_size), n), generator=generator, dtype=torch.int32)
+        scales = (torch.rand(zeros.shape, generator=generator) * 0.02 + 0.001).half()
+        prefix = f"model.layers.0.{name}"
+        tensors[f"{prefix}.qweight"] = pack_awq_qweight(q, bits=4)
+        tensors[f"{prefix}.qzeros"] = pack_awq_qzeros(zeros - 1, bits=4)
+        tensors[f"{prefix}.scales"] = scales
+        weight = ((q.t() - zeros[groups]).float() * scales[groups].float()).t()
+        reference[name] = lambda x, w=weight: F.linear(x, w)
+    return tensors, reference
+
+
 class TestAWQConfig(unittest.TestCase):
     def resolve(self, raw, requested=None):
         hf_config = lib.tiny_qwen3_config()
@@ -57,7 +75,8 @@ class TestAWQConfig(unittest.TestCase):
             ({**base, "version": "marlin"}, NotImplementedError),
             ({**base, "zero_point": False}, NotImplementedError),
             ({**base, "bits": 8}, NotImplementedError),
-            ({**base, "modules_to_not_convert": ["visual"]}, NotImplementedError),
+            ({**base, "checkpoint_format": "unknown"}, ValueError),
+            ({**base, "checkpoint_format": "nano-vllm", "group_size": -1}, ValueError),
             ({**base, "group_size": 0}, ValueError),
         ):
             with self.subTest(raw=raw), self.assertRaises(error):
@@ -65,8 +84,25 @@ class TestAWQConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.resolve(base, "gptq")
 
+    def test_reference_format_is_explicit(self):
+        raw = {"quant_method": "awq", "w_bit": 4, "q_group_size": 32, "modules_to_not_convert": ["lm_head"]}
+        self.assertEqual(self.resolve({**raw, "checkpoint_format": "nano-vllm"}), AWQConfig(32, "nano-vllm"))
+        hf_config = lib.tiny_qwen3_config()
+        hf_config.quantization_config = raw
+        self.assertEqual(resolve_quant_config(hf_config, "/nonexistent", "awq", "nano-vllm"), AWQConfig(32, "nano-vllm"))
+
 
 class TestAWQPacking(unittest.TestCase):
+    def test_reference_repo_zero_offset_and_natural_order(self):
+        config = AWQConfig(32, "nano-vllm")
+        q = torch.arange(8, dtype=torch.int32).repeat(32, 1)
+        zeros = torch.arange(1, 9, dtype=torch.int32).unsqueeze(0)
+        qweight = pack_awq_qweight(q.t(), bits=4)
+        qzeros = pack_awq_qzeros(zeros - 1, bits=4)
+        self.assertIs(config.convert_checkpoint_tensor("qweight", qweight), qweight)
+        torch.testing.assert_close(config.unpack_qzeros(qzeros), zeros)
+        torch.testing.assert_close(config.dequantize(qweight, qzeros, torch.ones(1, 8)), (q - zeros).float().t())
+
     def test_reorder_fixture(self):
         packed = torch.tensor([[to_int32(0x75316420)]], dtype=torch.int32)
         self.assertEqual(awq_to_natural(packed).item(), to_int32(0x76543210))
@@ -99,6 +135,40 @@ class TestAWQPacking(unittest.TestCase):
 
 
 class TestAWQLoading(unittest.TestCase):
+    def test_reference_repo_checkpoint(self):
+        for group_size in (32, 24):
+            with self.subTest(group_size=group_size):
+                tensors, reference = nano_awq_checkpoint(group_size)
+                model = lib.load_checkpoint(AWQConfig(group_size, "nano-vllm"), tensors)
+                lib.assert_matches_reference(self, model, reference)
+
+    def test_fused_reference_checkpoint(self):
+        tensors, reference = nano_awq_checkpoint(32)
+        for target, sources in lib.FUSED.items():
+            if len(sources) == 1:
+                continue
+            for suffix in ("qweight", "qzeros", "scales"):
+                keys = [f"model.layers.0.{source}.{suffix}" for source in sources]
+                tensors[f"model.layers.0.{target}.{suffix}"] = torch.cat([tensors.pop(key) for key in keys], dim=1)
+        model = lib.load_checkpoint(AWQConfig(32, "nano-vllm"), tensors)
+        lib.assert_matches_reference(self, model, reference)
+
+    def test_partial_checkpoint_selection_and_fused_validation(self):
+        tensors, reference = nano_awq_checkpoint(32)
+        prefix = "model.layers.0.self_attn.o_proj"
+        dense = torch.randn(64, 64)
+        for suffix in ("qweight", "qzeros", "scales"):
+            del tensors[f"{prefix}.{suffix}"]
+        tensors[f"{prefix}.weight"] = dense
+        reference["self_attn.o_proj"] = lambda x: F.linear(x, dense)
+        config = AWQConfig(32, "nano-vllm", frozenset(key.removesuffix(".qweight") for key in tensors if key.endswith(".qweight")))
+        model = lib.load_checkpoint(config, tensors)
+        self.assertIsNone(model.model.layers[0].self_attn.o_proj.quant_config)
+        lib.assert_matches_reference(self, model, reference)
+        config = AWQConfig(32, "nano-vllm", frozenset({"model.layers.0.self_attn.q_proj"}))
+        with self.assertRaisesRegex(ValueError, "part of fused layer"):
+            lib.load_checkpoint(config, tensors)
+
     def test_autoawq_checkpoint(self):
         for group_size in (32, -1):
             with self.subTest(group_size=group_size):
