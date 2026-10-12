@@ -3,7 +3,11 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.fp8 import Fp8Config, fp8_linear
+from nanovllm.fp8 import fp8_linear
+from nanovllm.quantization import QuantConfig
+from nanovllm.quantization.base import PACK_FACTOR, WNA16Config
+
+WNA16_PARAMS = ("qweight", "qzeros", "scales")
 
 
 def divide(numerator, denominator):
@@ -12,6 +16,7 @@ def divide(numerator, denominator):
 
 
 class LinearBase(nn.Module):
+    shard_ids: tuple = (None,)
 
     def __init__(
         self,
@@ -19,14 +24,18 @@ class LinearBase(nn.Module):
         output_size: int,
         bias: bool = False,
         tp_dim: int | None = None,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ):
         super().__init__()
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
+        self.input_size = input_size
+        self.output_size = output_size
         self.quant_config = quant_config
-        if quant_config is None:
+        if isinstance(quant_config, WNA16Config):
+            self.create_wna16_weights(quant_config)
+        elif quant_config is None:
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
             self.register_parameter("weight_scale_inv", None)
         else:
@@ -45,7 +54,8 @@ class LinearBase(nn.Module):
                 requires_grad=False,
             )
             self.weight_scale_inv.weight_loader = self.weight_scale_loader
-        self.weight.weight_loader = self.weight_loader
+        if not isinstance(quant_config, WNA16Config):
+            self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size), requires_grad=quant_config is None)
             self.bias.weight_loader = self.bias_loader
@@ -58,10 +68,62 @@ class LinearBase(nn.Module):
     def apply_linear(self, x: torch.Tensor, bias: torch.Tensor | None):
         if self.quant_config is None:
             return F.linear(x, self.weight, bias)
+        if isinstance(self.quant_config, WNA16Config):
+            return self.quant_config.linear(x, self.qweight, self.qzeros, self.scales, bias)
         return fp8_linear(x, self.weight, self.weight_scale_inv, bias, self.quant_config)
 
-    def bias_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
+    def bias_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
+        offset, size = self.output_shard(loaded_shard_id)
+        if self.tp_dim == 0:
+            loaded_weight = loaded_weight.chunk(self.tp_size)[self.tp_rank]
+        param.data.narrow(0, offset, size).copy_(loaded_weight)
+
+    def output_shard(self, loaded_shard_id) -> tuple[int, int]:
+        """Return ``(offset, size)`` of a checkpoint shard in this layer's output dimension."""
+        return 0, self.output_size
+
+    def create_wna16_weights(self, config: WNA16Config):
+        if self.tp_size != 1:
+            raise NotImplementedError(f"{config.method} only supports tensor_parallel_size=1")
+        k, n = self.input_size, self.output_size
+        num_groups = config.num_groups(k)
+        shapes = {
+            "qweight": (config.qweight_shape(k, n), torch.int32),
+            "qzeros": ((num_groups, n // PACK_FACTOR), torch.int32),
+            "scales": ((num_groups, n), torch.get_default_dtype()),
+        }
+        for name, (shape, dtype) in shapes.items():
+            param = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+            param.wna16_name = name
+            param.weight_loader = self.wna16_loader
+            self.register_parameter(name, param)
+        self.loaded_wna16_shards = set()
+
+    def wna16_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
+        name = param.wna16_name
+        offset, size = self.output_shard(loaded_shard_id)
+        if self.quant_config.packs_output_dim(name):
+            if offset % PACK_FACTOR or size % PACK_FACTOR:
+                raise ValueError(f"shard {loaded_shard_id!r} width {size} is not divisible by {PACK_FACTOR}")
+            offset, size = offset // PACK_FACTOR, size // PACK_FACTOR
+        loaded_weight = self.quant_config.convert_checkpoint_tensor(name, loaded_weight)
+        target = param.data.narrow(1, offset, size)
+        if loaded_weight.shape != target.shape:
+            raise ValueError(
+                f"{name} shard {loaded_shard_id!r}: checkpoint shape {tuple(loaded_weight.shape)} "
+                f"does not match expected {tuple(target.shape)}"
+            )
+        key = (name, loaded_shard_id)
+        if key in self.loaded_wna16_shards:
+            raise ValueError(f"{name} shard {loaded_shard_id!r} was loaded twice")
+        target.copy_(loaded_weight)
+        self.loaded_wna16_shards.add(key)
+
+    def check_wna16_loaded(self, prefix: str):
+        expected = {(name, shard_id) for name in WNA16_PARAMS for shard_id in self.shard_ids}
+        missing = expected - self.loaded_wna16_shards
+        if missing:
+            raise ValueError(f"{prefix}: checkpoint is missing quantized tensors {sorted(map(str, missing))}")
 
 
 class ReplicatedLinear(LinearBase):
@@ -71,7 +133,7 @@ class ReplicatedLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ):
         super().__init__(input_size, output_size, bias, quant_config=quant_config)
 
@@ -92,7 +154,7 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ):
         tp_size = dist.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0, quant_config)
@@ -118,10 +180,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ):
         self.output_sizes = output_sizes
+        self.shard_ids = tuple(range(len(output_sizes)))
         super().__init__(input_size, sum(output_sizes), bias, quant_config)
+
+    def output_shard(self, loaded_shard_id: int) -> tuple[int, int]:
+        offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+        return offset, self.output_sizes[loaded_shard_id] // self.tp_size
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
@@ -142,6 +209,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
+    shard_ids = ("q", "k", "v")
 
     def __init__(
         self,
@@ -150,7 +218,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
@@ -159,6 +227,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias, quant_config)
+
+    def output_shard(self, loaded_shard_id: str) -> tuple[int, int]:
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        return {"q": (0, q_size), "k": (q_size, kv_size), "v": (q_size + kv_size, kv_size)}[loaded_shard_id]
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -200,7 +273,7 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ):
         tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1, quant_config)

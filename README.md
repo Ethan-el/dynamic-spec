@@ -52,12 +52,33 @@ llm = LLM(
 )
 ```
 
+It also implements **INT4 weight-only (W4A16) inference for AWQ and GPTQ checkpoints**,
+adapted from [Brassinai/nano-vllm@e909386a](https://github.com/Brassinai/nano-vllm/tree/e909386a729e5d20113e0b67f7639d5f1b9a6c37/nanovllm/quantization):
+
+* AutoAWQ GEMM checkpoints (4-bit, zero point). The interleaved AWQ nibble order is converted to natural order once at load time.
+* GPTQ and GPTQ v2 checkpoints (4-bit, `desc_act=False`), with the legacy `zero - 1` convention handled.
+* `group_size` of any positive value or `-1`.
+* One Triton kernel that unpacks INT4 weights and runs an FP16 matmul with FP32 accumulation; activations, the KV cache, embeddings, normalization, and the LM head stay in float16.
+
+AWQ/GPTQ models run without speculative decoding and with `tensor_parallel_size=1`. Partially quantized checkpoints,
+activation-order GPTQ, quantized LM heads, and Marlin or other repacked layouts are rejected at startup.
+
+```python
+llm = LLM("/YOUR/QWEN3-AWQ-MODEL/PATH", quantization="awq")  # or "gptq"; None auto-detects
+```
+
+```bash
+python -m unittest discover -s tests -p "test_awq*.py"    # AWQ: AutoAWQ-packed checkpoints (CPU) + Triton kernel (CUDA)
+python -m unittest discover -s tests -p "test_gptq*.py"   # GPTQ: AutoGPTQ-packed checkpoints (CPU) + Triton kernel (CUDA)
+python -m unittest discover -s tests                      # everything
+python benchmarks/bench.py --model /YOUR/QWEN3-AWQ-MODEL/PATH --quantization awq
+```
+
 Planned quantization work, in priority order:
 
-1. Validate FP8 generation quality and benchmark latency, throughput, and memory on GPU.
+1. Validate FP8, AWQ, and GPTQ generation quality and benchmark latency, throughput, and memory on GPU.
 2. Add FP8 tensor parallelism and static activation-scale support.
-3. Add INT4 weight-only inference (W4A16), starting with AWQ/GPTQ checkpoint loading and a fused GEMM kernel.
-4. Add INT8 W8A8 and quantized KV cache after the weight-only path is measured.
+3. Add INT8 W8A8 and quantized KV cache after the weight-only path is measured.
 
 ## Installation
 

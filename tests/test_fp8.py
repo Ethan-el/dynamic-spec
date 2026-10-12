@@ -1,3 +1,5 @@
+import gpu_stubs  # noqa: F401  (must precede nanovllm imports)
+
 import unittest
 from types import SimpleNamespace
 

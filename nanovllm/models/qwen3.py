@@ -9,7 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from nanovllm.fp8 import Fp8Config
+from nanovllm.quantization import QuantConfig
 
 
 class Qwen3Attention(nn.Module):
@@ -25,7 +25,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -99,7 +99,7 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -129,7 +129,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -174,7 +174,7 @@ class Qwen3Model(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
@@ -208,7 +208,7 @@ class Qwen3ForCausalLM(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
-        quant_config: Fp8Config | None = None,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.model = Qwen3Model(config, quant_config)
