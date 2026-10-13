@@ -59,7 +59,10 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
+        # DSpark verification passes this step's K/V into flash attention,
+        # which appends them. context_lens excludes that query block.
+        dspark_verify = (not context.is_prefill) and context.decode_query_len > 1
+        if k_cache.numel() and v_cache.numel() and not dspark_verify:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
@@ -68,6 +71,23 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+        elif dspark_verify:
+            batch_size = context.context_lens.numel()
+            q = q.unflatten(0, (batch_size, context.decode_query_len))
+            k = k.unflatten(0, (batch_size, context.decode_query_len))
+            v = v.unflatten(0, (batch_size, context.decode_query_len))
+            o = flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k=k,
+                v=v,
+                cache_seqlens=context.context_lens,
+                softmax_scale=self.scale,
+                causal=True,
+                block_table=context.block_tables,
+            )
+            o = o.flatten(0, 1)
         else:    # decode
             if context.num_speculative_tokens > 0:
                 verify_width = context.num_speculative_tokens + 1

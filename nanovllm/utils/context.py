@@ -12,8 +12,11 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    # K=0 means normal prefill/decode; K>0 means speculative verify.
+    # K=0 means normal prefill/decode; K>0 means autoregressive draft verification.
     num_speculative_tokens: int = 0
+    # DSpark verification queries this many tokens per sequence and does not
+    # store them before attention. 1 keeps the normal decode path.
+    decode_query_len: int = 1
 
 _CONTEXT = Context()
 
@@ -30,6 +33,7 @@ def set_context(
     context_lens=None,
     block_tables=None,
     num_speculative_tokens=0,
+    decode_query_len=1,
     ):
     global _CONTEXT
 
@@ -43,6 +47,7 @@ def set_context(
         context_lens=context_lens,
         block_tables=block_tables,
         num_speculative_tokens=num_speculative_tokens,
+        decode_query_len=decode_query_len,
     )
 
 def reset_context():

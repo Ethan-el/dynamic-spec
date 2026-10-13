@@ -66,6 +66,8 @@ class TestEngineConfig(unittest.TestCase):
             with self.subTest(method=raw["quant_method"]):
                 with self.assertRaisesRegex(NotImplementedError, "speculative"):
                     Config(path, speculative_model=path, num_speculative_tokens=3)
+                with self.assertRaisesRegex(NotImplementedError, "speculative"):
+                    Config(path, speculative_config={"method": "dspark", "model": path, "num_speculative_tokens": 7})
                 with self.assertRaisesRegex(NotImplementedError, "tensor_parallel_size"):
                     Config(path, tensor_parallel_size=2)
 

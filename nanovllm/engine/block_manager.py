@@ -172,9 +172,13 @@ class BlockManager:
 
     def can_append(self, seq: Sequence) -> bool:
         if not self.has_draft:
-            return len(self.free_block_ids) >= (
-                len(seq) % self.block_size == 1
-            )
+            if self.num_speculative_tokens <= 0:
+                return len(self.free_block_ids) >= (
+                    len(seq) % self.block_size == 1
+                )
+            future_len = len(seq) + self.num_speculative_tokens
+            target_needed = max(0, self._blocks_needed(future_len) - len(seq.block_table))
+            return len(self.free_block_ids) >= target_needed
 
         assert self.free_draft_block_ids is not None
 
@@ -200,7 +204,12 @@ class BlockManager:
 
     def may_append(self, seq: Sequence):
         if not self.has_draft:
-            if len(seq) % self.block_size == 1:
+            if self.num_speculative_tokens <= 0:
+                if len(seq) % self.block_size == 1:
+                    seq.block_table.append(self._allocate_block())
+                return
+            needed = self._blocks_needed(len(seq) + self.num_speculative_tokens)
+            while len(seq.block_table) < needed:
                 seq.block_table.append(self._allocate_block())
             return
 

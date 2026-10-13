@@ -191,17 +191,26 @@ class Qwen3Model(nn.Module):
             [Qwen3DecoderLayer(config, quant_config, f"model.layers.{i}") for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def set_aux_hidden_state_layers(self, layer_ids: tuple[int, ...]):
+        self.aux_hidden_state_layers = tuple(layer_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_hidden_states = []
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if self.aux_hidden_state_layers:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -225,11 +234,14 @@ class Qwen3ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
+    def set_aux_hidden_state_layers(self, layer_ids: tuple[int, ...]):
+        self.model.set_aux_hidden_state_layers(layer_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         return self.model(input_ids, positions)
 
     def compute_logits(

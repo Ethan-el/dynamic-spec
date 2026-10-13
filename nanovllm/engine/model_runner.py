@@ -5,9 +5,11 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoConfig
 
-from nanovllm.config import Config
+from nanovllm.config import Config, load_dspark_hf_config
+from nanovllm.dspark import SpeculativeResult, accept_dspark_draft
 from nanovllm.dynamic_speculative import build_dynamic_speculative_lookup
 from nanovllm.engine.sequence import Sequence
+from nanovllm.models.dspark import DSparkKVCache, Qwen3DSparkModel
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.speculative import rejection_sample
@@ -22,7 +24,8 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        # DSpark verification has a variable query width, so it stays eager.
+        self.enforce_eager = config.enforce_eager or config.speculative_config is not None
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -40,8 +43,20 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config, config.quant_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.aux_hidden_states = None
+        self.dspark_hf_config = None
+        self.dspark_model = None
+        self.dspark_kv_cache = None
         self.draft_hf_config = None
         self.draft_model = None
+        if config.speculative_config is not None:
+            draft_config = load_dspark_hf_config(config.speculative_config.model)
+            self.model.set_aux_hidden_state_layers(tuple(draft_config.target_layer_ids))
+            self.dspark_hf_config = draft_config
+            self.dspark_model = Qwen3DSparkModel(draft_config)
+            load_model(self.dspark_model, config.speculative_config.model)
+            if self.dspark_model.block_size != config.speculative_config.num_speculative_tokens:
+                raise ValueError("DSpark block_size must equal num_speculative_tokens")
         if config.speculative_model is not None:
             self.draft_hf_config = AutoConfig.from_pretrained(config.speculative_model)
             assert self.draft_hf_config.vocab_size == hf_config.vocab_size, "target and draft vocab sizes must match"
@@ -166,6 +181,28 @@ class ModelRunner:
             # Use a common logical capacity; independently rounded budgets can
             # allocate extra draft blocks that have no matching target capacity.
             num_blocks = available // (block_bytes + draft_block_bytes)
+        elif self.dspark_model is not None:
+            draft_config = self.dspark_hf_config
+            draft_num_kv_heads = draft_config.num_key_value_heads // self.world_size
+            draft_head_dim = getattr(
+                draft_config,
+                "head_dim",
+                draft_config.hidden_size // draft_config.num_attention_heads,
+            )
+            draft_block_bytes = (
+                2
+                * draft_config.num_hidden_layers
+                * self.block_size
+                * draft_num_kv_heads
+                * draft_head_dim
+                * config.dtype.itemsize
+            )
+            num_blocks = available // (block_bytes + draft_block_bytes)
+            self._dspark_cache_shape = (
+                draft_config.num_hidden_layers,
+                draft_num_kv_heads,
+                draft_head_dim,
+            )
         else:
             num_blocks = available // block_bytes
 
@@ -187,6 +224,12 @@ class ModelRunner:
                 draft_head_dim,
             )
             self._bind_kv_cache(self.draft_model, self.draft_kv_cache)
+
+        if self.dspark_model is not None:
+            layers, kv_heads, head_dim = self._dspark_cache_shape
+            self.dspark_kv_cache = torch.empty(
+                2, layers, config.num_kvcache_blocks, self.block_size, kv_heads, head_dim
+            )
 
     @staticmethod
     def _bind_kv_cache(model, kv_cache):
@@ -399,7 +442,12 @@ class ModelRunner:
         ):
             phase = "prefill" if is_prefill else ("verify_eager" if is_verify else "decode_eager")
             with nvtx_range(f"nano.model.{phase}"):
-                hidden_states = self.model(input_ids, positions)
+                model_output = self.model(input_ids, positions)
+            if isinstance(model_output, tuple):
+                hidden_states, self.aux_hidden_states = model_output
+            else:
+                hidden_states = model_output
+                self.aux_hidden_states = None
             with nvtx_range("nano.model.lm_head"):
                 return self.model.compute_logits(hidden_states)
 
@@ -621,6 +669,159 @@ class ModelRunner:
         for seq in seqs:
             seq.draft_kv_len = len(seq)
 
+    def _dspark_cache(self, block_table, context_lens) -> DSparkKVCache:
+        return DSparkKVCache(self.dspark_kv_cache[0], self.dspark_kv_cache[1], block_table, context_lens)
+
+    def _prepare_dspark_sample(self, seqs: list[Sequence]) -> tuple[torch.Tensor, bool]:
+        temperatures = [seq.temperature for seq in seqs]
+        greedy = all(temperature == 0 for temperature in temperatures)
+        if not greedy and any(temperature == 0 for temperature in temperatures):
+            raise ValueError("mixing greedy (temperature=0) and non-greedy requests is not supported")
+        if greedy:
+            temperatures = [1.0] * len(temperatures)
+        return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True), greedy
+
+    def _sync_dspark_context_kv(self, positions: torch.Tensor):
+        if self.dspark_kv_cache is None or not self.aux_hidden_states:
+            return
+        context = get_context()
+        if context.slot_mapping is None or context.slot_mapping.numel() == 0:
+            return
+        self.dspark_model.append_context_kv(
+            self.aux_hidden_states,
+            positions,
+            self._dspark_cache(context.block_tables, context.context_lens),
+            context.slot_mapping,
+        )
+
+    def _run_dspark_draft(self, input_ids, positions, temperatures, greedy):
+        context = get_context()
+        draft_positions = positions.unsqueeze(1) + torch.arange(
+            self.dspark_model.block_size, device=positions.device
+        )
+        hidden_states = self.dspark_model.draft(
+            input_ids,
+            self._dspark_cache(context.block_tables, context.context_lens),
+            draft_positions,
+        )
+        base_logits = self.dspark_model.compute_logits(hidden_states)
+        self.draft_base_logits = base_logits
+        if self.rank == 0:
+            self.draft_token_ids = self.dspark_model.sample_draft_logits(
+                base_logits, input_ids, self.sampler, temperatures, greedy
+            )
+        else:
+            self.draft_token_ids = torch.empty(
+                base_logits.shape[:2], dtype=torch.int64, device=base_logits.device
+            )
+        if self.world_size > 1:
+            dist.broadcast(self.draft_token_ids, src=0)
+
+    def _verify_dspark(self, seqs, anchor_logits):
+        batch_size, num_draft_tokens = self.draft_token_ids.shape
+        positions, context_lens = [], []
+        for seq in seqs:
+            start = len(seq)
+            positions.extend(range(start, start + num_draft_tokens))
+            context_lens.append(start)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(
+            False,
+            context_lens=context_lens,
+            block_tables=self.prepare_block_tables(seqs),
+            decode_query_len=num_draft_tokens,
+        )
+        candidate_logits = self.run_model(self.draft_token_ids.flatten(), positions, False)
+        target_hidden = [
+            hidden.unflatten(0, (batch_size, num_draft_tokens)) for hidden in self.aux_hidden_states
+        ]
+        if self.rank != 0:
+            return None, None, target_hidden
+        candidate_logits = candidate_logits.unflatten(0, (batch_size, num_draft_tokens))
+        target_logits = torch.cat((anchor_logits.unsqueeze(1), candidate_logits[:, :-1]), dim=1)
+        return target_logits, candidate_logits[:, -1], target_hidden
+
+    def _append_accepted_dspark_kv(self, seqs, result: SpeculativeResult, target_hidden):
+        accepted_counts = [int(count) for count in result.num_accepted.tolist()]
+        if not any(accepted_counts):
+            return
+        accepted_hidden = [[] for _ in target_hidden]
+        positions, slot_mapping = [], []
+        for batch_idx, (seq, accepted_count) in enumerate(zip(seqs, accepted_counts)):
+            for layer_idx, hidden in enumerate(target_hidden):
+                accepted_hidden[layer_idx].append(hidden[batch_idx, :accepted_count])
+            for position in range(len(seq), len(seq) + accepted_count):
+                positions.append(position)
+                slot_mapping.append(self._slot_for(seq.block_table, position))
+        device = target_hidden[0].device
+        self.dspark_model.append_context_kv(
+            [torch.cat(parts) for parts in accepted_hidden],
+            torch.tensor(positions, dtype=torch.int64, device=device),
+            self._dspark_cache(get_context().block_tables, get_context().context_lens),
+            torch.tensor(slot_mapping, dtype=torch.int32, device=device),
+        )
+
+    def _commit_dspark(self, seqs, result: SpeculativeResult) -> list[list[int]] | None:
+        counts = [int(count) for count in result.num_tokens.tolist()]
+        rows = result.token_ids.tolist()
+        token_lists = []
+        for seq, row, count in zip(seqs, rows, counts):
+            committed = row[:count]
+            for token_id in committed:
+                seq.append_token(token_id)
+            token_lists.append(committed)
+        return token_lists if self.rank == 0 else None
+
+    def _verify_and_accept_dspark(self, seqs, input_ids, anchor_logits, temperatures, greedy):
+        target_logits, bonus_logits, target_hidden = self._verify_dspark(seqs, anchor_logits)
+        if self.rank == 0:
+            draft_logits = self.dspark_model.draft_logits_with_markov_bias(
+                self.draft_base_logits, input_ids, self.draft_token_ids
+            )
+            result = accept_dspark_draft(
+                self.draft_token_ids,
+                draft_logits,
+                target_logits,
+                bonus_logits,
+                temperatures,
+                greedy,
+                self.sampler,
+            )
+        else:
+            result = SpeculativeResult(
+                torch.empty(self.draft_token_ids.shape[0], self.draft_token_ids.shape[1] + 1, dtype=torch.int64, device=self.draft_token_ids.device),
+                torch.empty(self.draft_token_ids.shape[0], dtype=torch.int64, device=self.draft_token_ids.device),
+                torch.empty(self.draft_token_ids.shape[0], dtype=torch.int64, device=self.draft_token_ids.device),
+            )
+        if self.world_size > 1:
+            dist.broadcast(result.token_ids, src=0)
+            dist.broadcast(result.num_tokens, src=0)
+            dist.broadcast(result.num_accepted, src=0)
+        self._append_accepted_dspark_kv(seqs, result, target_hidden)
+        token_lists = self._commit_dspark(seqs, result)
+        reset_context()
+        return token_lists
+
+    def _run_dspark(self, seqs: list[Sequence], is_prefill: bool):
+        phase = "prefill" if is_prefill else "decode"
+        with nvtx_range(f"nano.prepare.{phase}"):
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            temperatures, greedy = self._prepare_dspark_sample(seqs) if self.rank == 0 else (None, False)
+        logits = self.run_model(input_ids, positions, is_prefill)
+        self._sync_dspark_context_kv(positions)
+        if is_prefill:
+            if self.rank != 0:
+                token_ids = None
+            elif greedy:
+                token_ids = logits.argmax(dim=-1).tolist()
+            else:
+                token_ids = self.sampler(logits, temperatures).tolist()
+            reset_context()
+            return token_ids
+        self._run_dspark_draft(input_ids, positions, temperatures, greedy)
+        return self._verify_and_accept_dspark(seqs, input_ids, logits, temperatures, greedy)
+
     def _run(
         self,
         seqs: list[Sequence],
@@ -638,6 +839,8 @@ class ModelRunner:
             )
         if not seqs:
             return [] if self.rank == 0 else None
+        if self.dspark_model is not None:
+            return self._run_dspark(seqs, is_prefill)
         if not is_prefill and self.draft_model is not None:
             temperatures = self.prepare_sample(seqs)
             if active_k == 0:
