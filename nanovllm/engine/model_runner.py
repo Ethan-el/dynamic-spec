@@ -206,6 +206,10 @@ class ModelRunner:
         else:
             num_blocks = available // block_bytes
 
+        if self.world_size > 1:
+            capacity = torch.tensor(num_blocks, device="cuda", dtype=torch.int64)
+            dist.all_reduce(capacity, op=dist.ReduceOp.MIN)
+            num_blocks = int(capacity.item())
         config.num_kvcache_blocks = num_blocks
         if num_blocks <= 0:
             raise RuntimeError("Insufficient GPU memory for a KV cache block")
@@ -620,6 +624,7 @@ class ModelRunner:
             hidden_states = self.draft_model(input_ids, positions)
             return self.draft_model.compute_logits(hidden_states)
 
+    @torch.inference_mode()
     def run(
         self,
         seqs: list[Sequence],

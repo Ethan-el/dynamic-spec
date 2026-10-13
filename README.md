@@ -61,13 +61,18 @@ adapted from [Brassinai/nano-vllm@e909386a](https://github.com/Brassinai/nano-vl
 * `group_size` of any positive value or `-1`.
 * One Triton kernel that unpacks INT4 weights and runs an FP16 matmul with FP32 accumulation; activations, the KV cache, embeddings, normalization, and the LM head stay in float16.
 
-AWQ/GPTQ models run without speculative decoding and with `tensor_parallel_size=1`.
+AWQ models support tensor parallelism when attention heads, packed output channels,
+and row-parallel input shards divide evenly across ranks; row shards must also align
+with the AWQ group size. GPTQ models still require `tensor_parallel_size=1`.
+Both formats run without speculative decoding.
+AWQ TP=2/4 weight loading has CPU test coverage; multi-GPU generation and performance still need GPU validation.
 AWQ selects quantized layers from the checkpoint's `qweight` names, keeps dense layers dense, and rejects partially quantized fused QKV/gate-up layers.
 Activation-order GPTQ, partially quantized GPTQ, quantized LM heads, and Marlin or other repacked layouts are rejected at startup.
 The reference AWQ format requires a positive group size; AutoAWQ also accepts `-1`.
 
 ```python
 llm = LLM("/YOUR/QWEN3-AWQ-MODEL/PATH", quantization="awq")  # or "gptq"; None auto-detects
+llm = LLM("/YOUR/QWEN3-AWQ-MODEL/PATH", quantization="awq", tensor_parallel_size=2)  # requires two GPUs
 # For a checkpoint exported by Brassinai/nano-vllm, whose layout differs from AutoAWQ:
 llm = LLM("/YOUR/NANO-AWQ-CHECKPOINT", quantization="awq", awq_checkpoint_format="nano-vllm")
 ```

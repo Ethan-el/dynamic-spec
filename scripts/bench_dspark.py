@@ -8,7 +8,10 @@ Greedy smoke test, then the reference size: 8 sequences, 256 new tokens, eager.
 """
 
 import argparse
+import gc
 from time import perf_counter
+
+import torch
 
 from nanovllm import LLM, SamplingParams
 
@@ -26,12 +29,15 @@ def main():
     parser.add_argument("--block-size", type=int, default=7)
     parser.add_argument("--bench", action="store_true", help="8 sequences x 256 tokens, plus a no-draft baseline")
     args = parser.parse_args()
-    common = dict(enforce_eager=True, max_model_len=4096, tensor_parallel_size=1)
+    common = dict(enforce_eager=True, max_model_len=4096, max_num_batched_tokens=1024, tensor_parallel_size=1)
 
     llm = LLM(args.model, speculative_config=speculative_config(args.draft, args.block_size), **common)
     output = llm.generate([PROMPT], SamplingParams(temperature=0, max_tokens=64))
     print(output[0]["text"])
     llm.exit()
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
     if not args.bench:
         return
 
@@ -52,6 +58,9 @@ def main():
         rate = accepted / attempted if attempted else 0
         print(f"{label}: {8 * 256 / elapsed:.2f} tok/s, accept={accepted}/{attempted} ({rate:.3f}), seconds={elapsed:.2f}")
         engine.exit()
+        del engine
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

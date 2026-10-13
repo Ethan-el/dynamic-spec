@@ -5,7 +5,7 @@ import torch
 from transformers import AutoConfig
 
 from nanovllm.fp8 import Fp8Config
-from nanovllm.quantization import QuantConfig, WNA16Config, resolve_quant_config
+from nanovllm.quantization import AWQConfig, QuantConfig, WNA16Config, resolve_quant_config
 from nanovllm.dynamic_speculative import (
     validate_and_normalize_dynamic_speculative_schedule,
 )
@@ -87,7 +87,7 @@ class Config:
             self.quantization = "fp8"
         else:
             self.quantization = self.quant_config.method
-        if self.quant_config is not None and self.tensor_parallel_size != 1:
+        if self.quant_config is not None and self.tensor_parallel_size != 1 and not isinstance(self.quant_config, AWQConfig):
             raise NotImplementedError(f"{self.quantization} only supports tensor_parallel_size=1")
         if isinstance(self.speculative_config, dict):
             self.speculative_config = SpeculativeConfig.from_dict(self.speculative_config)

@@ -86,8 +86,13 @@ class LinearBase(nn.Module):
         return 0, self.output_size
 
     def create_wna16_weights(self, config: WNA16Config):
-        if self.tp_size != 1:
+        if self.tp_size != 1 and not isinstance(config, AWQConfig):
             raise NotImplementedError(f"{config.method} only supports tensor_parallel_size=1")
+        if isinstance(config, AWQConfig) and self.tp_size > 1 and self.tp_dim == 1:
+            if config.group_size != -1 and self.input_size % config.group_size:
+                raise ValueError(
+                    f"AWQ row-parallel input shard {self.input_size} must align with group_size {config.group_size}"
+                )
         k, n = self.input_size, self.output_size
         num_groups = config.num_groups(k)
         shapes = {
@@ -111,6 +116,29 @@ class LinearBase(nn.Module):
             offset, size = offset // PACK_FACTOR, size // PACK_FACTOR
         loaded_weight = self.quant_config.convert_checkpoint_tensor(name, loaded_weight)
         target = param.data.narrow(1, offset, size)
+        if self.tp_size > 1:
+            if self.tp_dim == 0:
+                expected = (target.size(0), target.size(1) * self.tp_size)
+                if loaded_weight.shape != expected:
+                    raise ValueError(f"{name} shard {loaded_shard_id!r}: checkpoint shape {tuple(loaded_weight.shape)} does not match expected {expected}")
+                if loaded_shard_id is None and self.shard_ids != (None,):
+                    pieces = []
+                    for shard_id in self.shard_ids:
+                        shard_offset, shard_size = self.output_shard(shard_id)
+                        if self.quant_config.packs_output_dim(name):
+                            shard_offset, shard_size = shard_offset // PACK_FACTOR, shard_size // PACK_FACTOR
+                        pieces.append(loaded_weight.narrow(1, shard_offset * self.tp_size + self.tp_rank * shard_size, shard_size))
+                    loaded_weight = torch.cat(pieces, dim=1)
+                else:
+                    loaded_weight = loaded_weight.narrow(1, self.tp_rank * target.size(1), target.size(1))
+            elif self.tp_dim == 1:
+                replicate_group = name != "qweight" and self.quant_config.group_size == -1
+                expected_rows = target.size(0) if replicate_group else target.size(0) * self.tp_size
+                expected = (expected_rows, target.size(1))
+                if loaded_weight.shape != expected:
+                    raise ValueError(f"{name} shard {loaded_shard_id!r}: checkpoint shape {tuple(loaded_weight.shape)} does not match expected {expected}")
+                if not replicate_group:
+                    loaded_weight = loaded_weight.narrow(0, self.tp_rank * target.size(0), target.size(0))
         if loaded_weight.shape != target.shape:
             raise ValueError(
                 f"{name} shard {loaded_shard_id!r}: checkpoint shape {tuple(loaded_weight.shape)} "

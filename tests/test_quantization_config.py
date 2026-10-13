@@ -60,7 +60,7 @@ class TestEngineConfig(unittest.TestCase):
                 self.assertIsInstance(config.quant_config, quant_type)
                 self.assertEqual(config.dtype, dtype)
 
-    def test_awq_and_gptq_reject_speculative_decoding_and_tp(self):
+    def test_awq_tp_and_quantized_speculative_limits(self):
         for raw in (AWQ_RAW, GPTQ_RAW):
             path = model_dir(raw)
             with self.subTest(method=raw["quant_method"]):
@@ -68,8 +68,12 @@ class TestEngineConfig(unittest.TestCase):
                     Config(path, speculative_model=path, num_speculative_tokens=3)
                 with self.assertRaisesRegex(NotImplementedError, "speculative"):
                     Config(path, speculative_config={"method": "dspark", "model": path, "num_speculative_tokens": 7})
-                with self.assertRaisesRegex(NotImplementedError, "tensor_parallel_size"):
-                    Config(path, tensor_parallel_size=2)
+                if raw["quant_method"] == "awq":
+                    self.assertEqual(Config(path, tensor_parallel_size=2).tensor_parallel_size, 2)
+                    self.assertEqual(Config(path, tensor_parallel_size=4).tensor_parallel_size, 4)
+                else:
+                    with self.assertRaisesRegex(NotImplementedError, "tensor_parallel_size"):
+                        Config(path, tensor_parallel_size=2)
 
     def test_dense_checkpoint_rejects_explicit_quantization(self):
         for requested in ("awq", "gptq", "fp8"):
