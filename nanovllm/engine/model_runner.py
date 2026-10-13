@@ -35,7 +35,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        torch.set_default_dtype(config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config, config.quant_config)
         load_model(self.model, config.model)
@@ -146,7 +146,7 @@ class ModelRunner:
         available = int(total * config.gpu_memory_utilization - used - peak + current)
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * config.dtype.itemsize
         if self.draft_model is not None:
             draft_config = self.draft_hf_config
             draft_num_kv_heads = draft_config.num_key_value_heads // self.world_size

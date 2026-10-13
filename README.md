@@ -52,12 +52,55 @@ llm = LLM(
 )
 ```
 
+It also implements **INT4 weight-only (W4A16) inference for AWQ and GPTQ checkpoints**,
+adapted from [Brassinai/nano-vllm@e909386a](https://github.com/Brassinai/nano-vllm/tree/e909386a729e5d20113e0b67f7639d5f1b9a6c37/nanovllm/quantization):
+
+* AutoAWQ GEMM checkpoints (4-bit, zero point). The interleaved AWQ nibble order is converted to natural order once at load time.
+* Reference nano-vLLM AWQ checkpoints with natural column packing and `zero - 1` storage, selected explicitly with `awq_checkpoint_format="nano-vllm"` (or that value in the checkpoint's `checkpoint_format` metadata). These decode zeros as `unpack(qzeros) + 1`, matching the reference; AutoAWQ decodes zeros without that offset.
+* GPTQ and GPTQ v2 checkpoints (4-bit, `desc_act=False`), with the legacy `zero - 1` convention handled.
+* `group_size` of any positive value or `-1`.
+* One Triton kernel that unpacks INT4 weights and runs an FP16 matmul with FP32 accumulation; activations, the KV cache, embeddings, normalization, and the LM head stay in float16.
+
+AWQ/GPTQ models run without speculative decoding and with `tensor_parallel_size=1`.
+AWQ selects quantized layers from the checkpoint's `qweight` names, keeps dense layers dense, and rejects partially quantized fused QKV/gate-up layers.
+Activation-order GPTQ, partially quantized GPTQ, quantized LM heads, and Marlin or other repacked layouts are rejected at startup.
+The reference AWQ format requires a positive group size; AutoAWQ also accepts `-1`.
+
+```python
+llm = LLM("/YOUR/QWEN3-AWQ-MODEL/PATH", quantization="awq")  # or "gptq"; None auto-detects
+# For a checkpoint exported by Brassinai/nano-vllm, whose layout differs from AutoAWQ:
+llm = LLM("/YOUR/NANO-AWQ-CHECKPOINT", quantization="awq", awq_checkpoint_format="nano-vllm")
+```
+
+```bash
+python -m unittest discover -s tests -p "test_awq*.py"    # AWQ: AutoAWQ-packed checkpoints (CPU) + Triton kernel (CUDA)
+python -m unittest discover -s tests -p "test_gptq*.py"   # GPTQ: AutoGPTQ-packed checkpoints (CPU) + Triton kernel (CUDA)
+python -m unittest discover -s tests                      # everything
+python benchmarks/bench.py --model /YOUR/QWEN3-AWQ-MODEL/PATH --quantization awq
+# Add --awq-checkpoint-format nano-vllm for the reference export format.
+python scripts/test_awq.py --model /YOUR/QWEN3-AWQ-MODEL/PATH --disable-compile
+```
+
+If PyTorch Inductor fails at import time (e.g. `duplicate template name` in PyTorch 2.9.1),
+set `TORCH_COMPILE_DISABLE=1` **before importing nanovllm**:
+
+```bash
+TORCH_COMPILE_DISABLE=1 python -m unittest discover -s tests -p "test_awq*.py" -v
+TORCH_COMPILE_DISABLE=1 python benchmarks/bench.py --model /YOUR/QWEN3-AWQ-MODEL/PATH --quantization awq
+```
+
+This explicitly bypasses the project's `torch.compile` decorators and prints a warning.
+Only PyTorch compilation of activation, RMSNorm, RoPE and sampling is disabled; the AWQ/GPTQ Triton JIT kernels,
+FlashAttention and CUDA Graph remain enabled. There is no additional quantization or change to the mathematical formulas,
+but floating-point rounding can differ and more kernels/intermediate tensors may reduce throughput or increase latency.
+Performance measurements in this mode should be labeled accordingly. The default remains compilation enabled;
+`enforce_eager=True` controls CUDA Graph separately and does not disable `torch.compile`.
+
 Planned quantization work, in priority order:
 
-1. Validate FP8 generation quality and benchmark latency, throughput, and memory on GPU.
+1. Validate FP8, AWQ, and GPTQ generation quality and benchmark latency, throughput, and memory on GPU.
 2. Add FP8 tensor parallelism and static activation-scale support.
-3. Add INT4 weight-only inference (W4A16), starting with AWQ/GPTQ checkpoint loading and a fused GEMM kernel.
-4. Add INT8 W8A8 and quantized KV cache after the weight-only path is measured.
+3. Add INT8 W8A8 and quantized KV cache after the weight-only path is measured.
 
 ## Installation
 
