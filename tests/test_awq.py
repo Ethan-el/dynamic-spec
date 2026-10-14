@@ -3,12 +3,15 @@
 import quant_testlib as lib  # noqa: F401  (installs GPU stubs first)
 
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
+from nanovllm.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from nanovllm.quantization import resolve_quant_config
-from nanovllm.quantization.awq import AWQConfig, awq_to_natural
+from nanovllm.quantization.awq import AWQ_PACK_ORDER, AWQConfig, awq_to_natural
 from nanovllm.quantization.base import pack_int4, unpack_int4
 from upstream import autoawq
 from upstream.nano_awq_packing import pack_awq_qweight, pack_awq_qzeros
@@ -205,6 +208,91 @@ class TestAWQLoading(unittest.TestCase):
         tensors["model.layers.0.mlp.up_proj.g_idx"] = torch.arange(64, dtype=torch.int32) // 32
         with self.assertRaisesRegex(ValueError, "g_idx"):
             lib.load_checkpoint(AWQConfig(32), tensors)
+
+
+class TestAWQTensorParallel(unittest.TestCase):
+    @staticmethod
+    def checkpoint(k, n, config, seed):
+        generator = torch.Generator().manual_seed(seed)
+        groups = 1 if config.group_size == -1 else k // config.group_size
+        q = torch.randint(0, 16, (k, n), generator=generator, dtype=torch.int32)
+        zeros = torch.randint(1, 16, (groups, n), generator=generator, dtype=torch.int32)
+        scales = torch.rand(groups, n, generator=generator) * 0.02 + 0.001
+        if config.checkpoint_format == "autoawq":
+            q = q.unflatten(1, (-1, 8))[..., list(AWQ_PACK_ORDER)].flatten(1)
+            zeros = zeros.unflatten(1, (-1, 8))[..., list(AWQ_PACK_ORDER)].flatten(1)
+        else:
+            zeros -= 1
+        return {
+            "qweight": pack_int4(q, 1),
+            "qzeros": pack_int4(zeros, 1),
+            "scales": scales,
+        }
+
+    @staticmethod
+    def dense(config, source):
+        return config.dequantize(
+            config.convert_checkpoint_tensor("qweight", source["qweight"]),
+            config.convert_checkpoint_tensor("qzeros", source["qzeros"]),
+            source["scales"],
+        )
+
+    @staticmethod
+    def load(module, sources, fused):
+        for name in ("qweight", "qzeros", "scales"):
+            if fused:
+                module.wna16_loader(getattr(module, name), torch.cat([source[name] for source in sources], dim=1))
+            else:
+                for shard_id, source in zip(module.shard_ids, sources):
+                    module.wna16_loader(getattr(module, name), source[name], shard_id)
+        module.check_wna16_loaded("test")
+
+    def test_column_and_fused_projection_tp2_tp4(self):
+        x = torch.randn(3, 128, generator=torch.Generator().manual_seed(9))
+        for tp in (2, 4):
+            for group_size in (32, -1):
+                config = AWQConfig(group_size, "nano-vllm" if group_size > 0 else "autoawq")
+                for kind, ids in (("merged", (0, 1)), ("qkv", ("q", "k", "v"))):
+                    sources = [self.checkpoint(128, 64, config, i) for i in range(len(ids))]
+                    for fused in (False, True):
+                        for rank in range(tp):
+                            with self.subTest(tp=tp, group_size=group_size, kind=kind, fused=fused, rank=rank), \
+                                 patch.object(dist, "get_world_size", return_value=tp), \
+                                 patch.object(dist, "get_rank", return_value=rank):
+                                module = (MergedColumnParallelLinear(128, [64, 64], quant_config=config)
+                                          if kind == "merged" else QKVParallelLinear(128, 8, 8, 8, quant_config=config))
+                                self.load(module, sources, fused)
+                                expected = torch.cat([
+                                    F.linear(x, self.dense(config, source))
+                                    [:, rank * (64 // tp):(rank + 1) * (64 // tp)]
+                                    for source in sources
+                                ], dim=-1)
+                                torch.testing.assert_close(module(x), expected, rtol=0, atol=1e-5)
+
+    def test_row_projection_tp2_tp4(self):
+        x = torch.randn(3, 128, generator=torch.Generator().manual_seed(11))
+        for tp in (2, 4):
+            for group_size in (32, -1):
+                config = AWQConfig(group_size, "nano-vllm" if group_size > 0 else "autoawq")
+                source = self.checkpoint(128, 64, config, 5)
+                expected = F.linear(x, self.dense(config, source))
+                parts = []
+                for rank in range(tp):
+                    with patch.object(dist, "get_world_size", return_value=tp), \
+                         patch.object(dist, "get_rank", return_value=rank), \
+                         patch.object(dist, "all_reduce"):
+                        module = RowParallelLinear(128, 64, quant_config=config)
+                        for name, tensor in source.items():
+                            module.wna16_loader(getattr(module, name), tensor)
+                        module.check_wna16_loaded("row")
+                        parts.append(module(x[:, rank * (128 // tp):(rank + 1) * (128 // tp)]))
+                with self.subTest(tp=tp, group_size=group_size):
+                    torch.testing.assert_close(sum(parts), expected, rtol=1e-5, atol=1e-5)
+
+    def test_rejects_unaligned_group_boundary(self):
+        with patch.object(dist, "get_world_size", return_value=4), patch.object(dist, "get_rank", return_value=0):
+            with self.assertRaisesRegex(ValueError, "align with group_size"):
+                RowParallelLinear(128, 64, quant_config=AWQConfig(24, "nano-vllm"))
 
 
 if __name__ == "__main__":

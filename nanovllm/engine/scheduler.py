@@ -1,4 +1,5 @@
 from collections import deque
+from itertools import chain
 
 from nanovllm.config import Config
 from nanovllm.dynamic_speculative import build_dynamic_speculative_lookup
@@ -29,6 +30,7 @@ class Scheduler:
             else None
         )
         self.last_num_speculative_tokens = 0
+        self.dspark = config.speculative_config is not None
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
             config.kvcache_block_size,
@@ -42,6 +44,13 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if self.dspark:
+            greedy = seq.temperature == 0
+            for existing in chain(self.waiting, self.running):
+                if (existing.temperature == 0) != greedy:
+                    raise ValueError(
+                        "mixing greedy (temperature=0) and non-greedy requests is not supported"
+                    )
         self.waiting.append(seq)
 
     def select_num_speculative_tokens(self, batch_size: int) -> int:
